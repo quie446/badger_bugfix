@@ -46,6 +46,12 @@ type testOnlyDBExtensions struct {
 	// inject a delete + compaction into the race window to reproduce the
 	// GC write-back race deterministically.
 	vlogGCPauseHook func()
+
+	// flushVlogSyncHook is called inside handleMemTableFlush() right after
+	// the value log has been synced and before the L0 table is built. Nil in
+	// production. Tests use it to assert that the value log is durable
+	// before value pointers are persisted into an SSTable.
+	flushVlogSyncHook func()
 }
 
 // logToSyncChan sends a message to the DB's syncChan. Note that we expect

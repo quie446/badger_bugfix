@@ -746,32 +746,58 @@ func (reqs requests) IncrRef() {
 	}
 }
 
-// sync function syncs content of latest value log file to disk. Syncing of value log directory is
-// not required here as it happens every time a value log file rotation happens(check createVlogFile
-// function). During rotation, previous value log file also gets synced to disk. It only syncs file
-// if fid >= vlog.maxFid. In some cases such as replay(while opening db), it might be called with
-// fid < vlog.maxFid. To sync irrespective of file id just call it with math.MaxUint32.
+// sync flushes all value log files to disk. Every file is synced, not just
+// the writable one: rotated files are only synced at rotation time when
+// SyncWrites is set, so without this, entries referenced by a synced WAL (or
+// by an SSTable after a memtable flush) could still be lost in a crash.
+// Syncing of the value log directory is not required here as it happens
+// every time a value log file rotation happens (check createVlogFile
+// function).
 func (vlog *valueLog) sync() error {
 	if vlog.opt.SyncWrites || vlog.opt.InMemory {
+		// With SyncWrites, every write is synced as it happens and files are
+		// synced at rotation time, so there is nothing left to do. InMemory
+		// mode has no files at all.
 		return nil
 	}
 
 	vlog.filesLock.RLock()
-	maxFid := vlog.maxFid
-	curlf := vlog.filesMap[maxFid]
-	// Sometimes it is possible that vlog.maxFid has been increased but file creation
-	// with same id is still in progress and this function is called. In those cases
-	// entry for the file might not be present in vlog.filesMap.
-	if curlf == nil {
-		vlog.filesLock.RUnlock()
-		return nil
+	defer vlog.filesLock.RUnlock()
+	for _, lf := range vlog.filesMap {
+		lf.lock.RLock()
+		err := lf.Sync()
+		lf.lock.RUnlock()
+		if err != nil {
+			return y.Wrapf(err, "while syncing value log file: %q", lf.path)
+		}
 	}
-	curlf.lock.RLock()
-	vlog.filesLock.RUnlock()
+	return nil
+}
 
-	err := curlf.Sync()
-	curlf.lock.RUnlock()
-	return err
+// validateValuePointer reports whether the value log entry referenced by vp
+// is fully present on disk: the file must exist, the [offset, offset+len)
+// range must lie within the file, and the entry checksum must match. It is
+// used during crash recovery to detect WAL entries whose value log data
+// never made it to disk before the crash.
+func (vlog *valueLog) validateValuePointer(vp valuePointer) bool {
+	vlog.filesLock.RLock()
+	lf, ok := vlog.filesMap[vp.Fid]
+	vlog.filesLock.RUnlock()
+	if !ok {
+		return false
+	}
+
+	lf.lock.RLock()
+	defer lf.lock.RUnlock()
+	buf, err := lf.read(vp)
+	if err != nil || len(buf) < crc32.Size {
+		return false
+	}
+	hash := crc32.New(y.CastagnoliCrcTable)
+	if _, err := hash.Write(buf[:len(buf)-crc32.Size]); err != nil {
+		return false
+	}
+	return hash.Sum32() == y.BytesToU32(buf[len(buf)-crc32.Size:])
 }
 
 func (vlog *valueLog) woffset() uint32 {

@@ -130,7 +130,7 @@ func (db *DB) openMemTable(fid, flags int) (*memTable, error) {
 	if lerr == z.NewFile {
 		return mt, lerr
 	}
-	err := mt.UpdateSkipList()
+	err := mt.UpdateSkipList(db.vlog.validateValuePointer)
 	return mt, y.Wrapf(err, "while updating skiplist")
 }
 
@@ -198,13 +198,22 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 	return nil
 }
 
-func (mt *memTable) UpdateSkipList() error {
+// UpdateSkipList replays the WAL into the skiplist. validateVptr, when
+// non-nil, is called for every entry that carries a value log pointer; if it
+// reports the pointer as not durable, the entry is treated as lost to the
+// crash and skipped instead of being resurrected with a dangling pointer.
+func (mt *memTable) UpdateSkipList(validateVptr func(vp valuePointer) bool) error {
 	if mt.wal == nil || mt.sl == nil {
 		return nil
 	}
-	endOff, err := mt.wal.iterate(true, 0, mt.replayFunction(mt.opt))
+	var discarded int
+	endOff, err := mt.wal.iterate(true, 0, mt.replayFunction(mt.opt, validateVptr, &discarded))
 	if err != nil {
 		return y.Wrapf(err, "while iterating wal: %s", mt.wal.Fd.Name())
+	}
+	if discarded > 0 {
+		mt.opt.Warningf("Discarded %d entries from WAL %s during replay: "+
+			"their value log data did not survive the crash", discarded, mt.wal.Fd.Name())
 	}
 	if endOff < mt.wal.size.Load() && mt.opt.ReadOnly {
 		return y.Wrapf(ErrTruncateNeeded, "end offset: %d < size: %d", endOff, mt.wal.size.Load())
@@ -222,7 +231,9 @@ func (mt *memTable) DecrRef() {
 	mt.sl.DecrRef()
 }
 
-func (mt *memTable) replayFunction(opt Options) func(Entry, valuePointer) error {
+func (mt *memTable) replayFunction(
+	opt Options, validateVptr func(vp valuePointer) bool, discarded *int,
+) func(Entry, valuePointer) error {
 	first := true
 	return func(e Entry, _ valuePointer) error { // Function for replaying.
 		if first {
@@ -231,6 +242,19 @@ func (mt *memTable) replayFunction(opt Options) func(Entry, valuePointer) error 
 		first = false
 		if ts := y.ParseTs(e.Key); ts > mt.maxVersion {
 			mt.maxVersion = ts
+		}
+		// The write path appends to the value log before the WAL, but neither
+		// is fsynced on every write, so after a crash the WAL can reference
+		// value log data that never reached disk. Such an entry was never
+		// durable; drop it instead of exposing a dangling pointer (reads of
+		// which would fail checksum verification or, worse, decode garbage).
+		if e.meta&bitValuePointer > 0 && validateVptr != nil {
+			var vp valuePointer
+			vp.Decode(e.Value)
+			if !validateVptr(vp) {
+				*discarded++
+				return nil
+			}
 		}
 		v := y.ValueStruct{
 			Value:     e.Value,
