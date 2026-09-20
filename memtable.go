@@ -130,7 +130,7 @@ func (db *DB) openMemTable(fid, flags int) (*memTable, error) {
 	if lerr == z.NewFile {
 		return mt, lerr
 	}
-	err := mt.UpdateSkipList()
+	err := mt.UpdateSkipList(&db.vlog)
 	return mt, y.Wrapf(err, "while updating skiplist")
 }
 
@@ -198,11 +198,11 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 	return nil
 }
 
-func (mt *memTable) UpdateSkipList() error {
+func (mt *memTable) UpdateSkipList(vlog *valueLog) error {
 	if mt.wal == nil || mt.sl == nil {
 		return nil
 	}
-	endOff, err := mt.wal.iterate(true, 0, mt.replayFunction(mt.opt))
+	endOff, err := mt.wal.iterate(true, 0, mt.replayFunction(mt.opt, vlog))
 	if err != nil {
 		return y.Wrapf(err, "while iterating wal: %s", mt.wal.Fd.Name())
 	}
@@ -222,7 +222,7 @@ func (mt *memTable) DecrRef() {
 	mt.sl.DecrRef()
 }
 
-func (mt *memTable) replayFunction(opt Options) func(Entry, valuePointer) error {
+func (mt *memTable) replayFunction(opt Options, vlog *valueLog) func(Entry, valuePointer) error {
 	first := true
 	return func(e Entry, _ valuePointer) error { // Function for replaying.
 		if first {
@@ -231,6 +231,22 @@ func (mt *memTable) replayFunction(opt Options) func(Entry, valuePointer) error 
 		first = false
 		if ts := y.ParseTs(e.Key); ts > mt.maxVersion {
 			mt.maxVersion = ts
+		}
+		// The value log and the WAL are written (and synced) independently,
+		// so a crash can leave a durable WAL entry pointing at a value log
+		// tail that never made it to disk and was truncated away during vlog
+		// recovery. Replaying such an entry would resurrect a dangling value
+		// pointer and surface checksum/EOF errors on the first read. Treat
+		// the write as lost instead, which is exactly what an unsynced write
+		// is allowed to do.
+		if e.meta&bitValuePointer > 0 && vlog != nil {
+			var vp valuePointer
+			vp.Decode(e.Value)
+			if !vlog.validPointer(vp) {
+				opt.Warningf("Dropping WAL entry for key=%q: value pointer %+v "+
+					"is beyond the recovered value log\n", e.Key, vp)
+				return nil
+			}
 		}
 		v := y.ValueStruct{
 			Value:     e.Value,

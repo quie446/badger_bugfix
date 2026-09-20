@@ -778,6 +778,26 @@ func (vlog *valueLog) woffset() uint32 {
 	return vlog.writableLogOffset.Load()
 }
 
+// validPointer reports whether vp refers to value log data that survived
+// recovery. It is used while replaying memtable WALs after a crash: the WAL
+// and the value log are written (and synced) independently, so a durable WAL
+// entry can point at a vlog tail that was lost and truncated away. Entries
+// carrying such dangling pointers must be treated as lost writes, not
+// replayed into the memtable.
+func (vlog *valueLog) validPointer(vp valuePointer) bool {
+	vlog.filesLock.RLock()
+	lf, ok := vlog.filesMap[vp.Fid]
+	vlog.filesLock.RUnlock()
+	if !ok {
+		return false
+	}
+	// lf.size is the file's valid end: for files rotated away before the
+	// crash it is the offset they were truncated to by doneWriting, and for
+	// the file that was active at crash time it is the offset vlog.open
+	// truncated to after validating entries up to the first torn one.
+	return uint64(vp.Offset)+uint64(vp.Len) <= uint64(lf.size.Load())
+}
+
 // validateWrites will check whether the given requests can fit into 4GB vlog file.
 // NOTE: 4GB is the maximum size we can create for vlog because value pointer offset is of type
 // uint32. If we create more than 4GB, it will overflow uint32. So, limiting the size to 4GB.

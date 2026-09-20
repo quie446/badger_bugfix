@@ -341,6 +341,15 @@ func Open(opt Options) (*DB, error) {
 	db.closers.updateSize = z.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
 
+	// Initialize and open the value log before replaying the memtable WALs.
+	// vlog.open truncates the last vlog file to its valid end, and WAL replay
+	// relies on that to drop entries whose value log tail was lost in a
+	// crash (see memTable.replayFunction).
+	db.vlog.init(db)
+	if err = db.vlog.open(db); err != nil {
+		return db, y.Wrapf(err, "During db.vlog.open")
+	}
+
 	if err := db.openMemTables(db.opt); err != nil {
 		return nil, y.Wrapf(err, "while opening memtables")
 	}
@@ -355,9 +364,6 @@ func Open(opt Options) (*DB, error) {
 	if db.lc, err = newLevelsController(db, &manifest); err != nil {
 		return db, err
 	}
-
-	// Initialize vlog struct.
-	db.vlog.init(db)
 
 	if !opt.ReadOnly {
 		db.closers.compactors = z.NewCloser(1)
@@ -375,10 +381,6 @@ func Open(opt Options) (*DB, error) {
 	// We do increment nextTxnTs below. So, no need to do it here.
 	db.orc.nextTxnTs = db.MaxVersion()
 	db.opt.Infof("Set nextTxnTs to %d", db.orc.nextTxnTs)
-
-	if err = db.vlog.open(db); err != nil {
-		return db, y.Wrapf(err, "During db.vlog.open")
-	}
 
 	// Let's advance nextTxnTs to one more than whatever we observed via
 	// replaying the logs.
@@ -711,37 +713,19 @@ func (db *DB) Sync() error {
 		return nil
 	}
 
-	/**
-	Make an attempt to sync both the logs, the active memtable's WAL and the vLog (1847).
-	Cases:
-	- All_ok			:: If both the logs sync successfully.
+	// The value log must be synced BEFORE the memtable's WAL. A WAL entry
+	// can carry a value pointer into the vlog, so the durability invariant
+	// is: a WAL entry may only become durable once the vlog data it points
+	// to is durable. Syncing in the opposite order would let a crash leave
+	// a durable WAL entry referring to a vlog tail that never reached disk.
+	// (Recovery also defends against this by dropping dangling pointers,
+	// see memTable.replayFunction, but Sync must not widen the window.)
+	vLogSyncError := db.vlog.sync()
 
-	- Entry_Lost		:: If an entry with a value pointer was present in the active memtable's WAL,
-						:: and the WAL was synced but there was an error in syncing the vLog.
-						:: The entry will be considered lost and this case will need to be handled during recovery.
-
-	- Entries_Lost		:: If there were errors in syncing both the logs, multiple entries would be lost.
-
-	- Entries_Lost      :: If the active memtable's WAL is not synced but the vLog is synced, it will
-						:: result in entries being lost because recovery of the active memtable is done from its WAL.
-						:: Check `UpdateSkipList` in memtable.go.
-
-	- Nothing_lost		:: If an entry with its value was present in the active memtable's WAL, and the WAL was synced,
-						:: but there was an error in syncing the vLog.
-						:: Nothing is lost for this very specific entry because the entry is completely present in the memtable's WAL.
-
-	- Partially_lost    :: If entries were written partially in either of the logs,
-						:: the logs will be truncated during recovery.
-						:: As a result of truncation, some entries might be lost.
-					    :: Assume that 4KB of data is to be synced and invoking `Sync` results only in syncing 3KB
-	                    :: of data and then the machine shuts down or the disk failure happens,
-						:: this will result in partial writes. [[This case needs verification]]
-	*/
 	db.lock.RLock()
 	memtableSyncError := db.mt.SyncWAL()
 	db.lock.RUnlock()
 
-	vLogSyncError := db.vlog.sync()
 	return y.CombineErrors(memtableSyncError, vLogSyncError)
 }
 
